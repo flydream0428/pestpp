@@ -900,6 +900,19 @@ void upgrade_thread_function(int id, int iter, double cur_lam, bool use_glm_form
 
 	return;
 }
+void upgrade_thread_function_multi(int id, int iter, vector<double> lams, bool use_glm_form, vector<string> par_names,
+								vector<string> obs_names, UpgradeThread& worker, exception_ptr& eptr)
+{
+	try
+	{
+		worker.work_multi_lambda(id, iter, lams, use_glm_form, par_names, obs_names);
+	}
+	catch (...)
+	{
+		eptr = current_exception();
+	}
+
+}
 
 //void work(int thread_id, int iter, double cur_lam, bool use_glm_form, Eigen::VectorXd parcov_inv_vec, Eigen::MatrixXd Am);
 void upgrade_thread_function_mm(int id, int iter, double cur_lam, bool use_glm_form, Eigen::VectorXd parcov_inv_vec,
@@ -1298,6 +1311,98 @@ void EnsembleSolver::solve(int num_threads, double cur_lam, bool use_glm_form, P
 }
 
 
+void EnsembleSolver::solve_multi_lambda(int num_threads, const vector<double>& lams, bool use_glm_form, vector<ParameterEnsemble>& pe_upgrades,
+                                        unordered_map<string, pair<vector<string>, vector<string>>>& loc_map)
+{
+	if (pe_upgrades.size() != lams.size())
+		throw runtime_error("EnsembleSolver::solve_multi_lambda(): number of upgrade ensembles != number of lambda values");
+	if (!localizer.get_use())
+	{
+		string center_on = pest_scenario.get_pestpp_options().get_ies_center_on();
+		for (int i = 0; i < lams.size(); i++)
+			nonlocalized_solve(lams[i], use_glm_form, pe_upgrades[i], center_on);
+		return;
+	}
+	vector<ParameterEnsemble*> targets;
+	for (auto& pe_up : pe_upgrades)
+	{
+		pe_up.set_zeros();
+		targets.push_back(&pe_up);
+	}
+	stringstream ss;
+	Localizer::How _how = localizer.get_how();
+	if (localizer.get_loctyp() == Localizer::LocTyp::COVARIANCE)
+	{
+		throw runtime_error("EnsembleSolver::solve_multi_lambda(): 'covariance' localization is deprecated");
+	}
+	UpgradeThread* ut_ptr;
+	ut_ptr = new LocalAnalysisUpgradeThread(performance_log, par_resid_map, par_diff_map, obs_resid_map,
+	                                        obs_diff_map, obs_err_map,
+	                                        localizer, parcov_inv_map, weight_map, pe_upgrades[0], loc_map, Am_map,
+	                                        _how, reg_factor);
+	ut_ptr->set_real_weights(mm_current_weights);
+	ut_ptr->set_pe_upgrades(targets);
+	ss.str("");
+	ss << "using local analysis upgrade thread for " << lams.size() << " lambda values and " << loc_map.size() << " localizer cases";
+	performance_log->log_event(ss.str());
+
+	if ((num_threads < 1) || (loc_map.size() == 1))
+	{
+		ut_ptr->work_multi_lambda(0, iter, lams, use_glm_form, act_par_names, act_obs_names);
+		delete ut_ptr;
+	}
+	else
+	{
+		Eigen::setNbThreads(1);
+		vector<thread> threads;
+		vector<exception_ptr> exception_ptrs;
+		message(2, "launching threads");
+		for (int i = 0; i < num_threads; i++)
+		{
+			exception_ptrs.push_back(exception_ptr());
+		}
+		for (int i = 0; i < num_threads; i++)
+		{
+			threads.push_back(thread(upgrade_thread_function_multi, i, iter, lams, use_glm_form, act_par_names,
+				act_obs_names, std::ref(*ut_ptr), std::ref(exception_ptrs[i])));
+		}
+		message(2, "waiting to join threads");
+		ss.str("");
+		int num_exp = 0;
+		for (int i = 0; i < num_threads; ++i)
+		{
+			threads[i].join();
+		}
+		for (int i = 0; i < num_threads; ++i)
+		{
+			if (exception_ptrs[i])
+			{
+				num_exp++;
+				try
+				{
+					rethrow_exception(exception_ptrs[i]);
+				}
+				catch (const std::exception& e)
+				{
+					ss << " thread " << i << " raised an exception: " << e.what();
+				}
+				catch (...)
+				{
+					ss << " thread " << i << " raised an exception";
+				}
+			}
+		}
+		if (num_exp > 0)
+		{
+			performance_log->log_event(ss.str());
+			throw runtime_error(ss.str());
+		}
+		delete ut_ptr;
+		message(1, "upgrade calculation done");
+	}
+}
+
+
 void EnsembleSolver::message(int level, const string& _message)
 {
 	message(level, _message, vector<string>());
@@ -1604,6 +1709,95 @@ void UpgradeThread::ensemble_solution(const int iter, const int verbose_level,co
 
 }
 
+
+void UpgradeThread::ensemble_solution_multi_lambda(const int iter, const int verbose_level,const int maxsing,  const int thread_id,
+                              const int t_count, const bool use_prior_scaling,const bool use_approx, const bool use_glm,
+                              const vector<double>& lams,const double eigthresh, Eigen::MatrixXd& par_resid, Eigen::MatrixXd& par_diff,
+                              const Eigen::MatrixXd& Am, Eigen::MatrixXd& obs_resid,Eigen::MatrixXd& obs_diff, vector<Eigen::MatrixXd>& upgrades,
+                              Eigen::MatrixXd& obs_err, const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& weights,
+                              const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& parcov_inv,
+                              const vector<string>& act_obs_names,const vector<string>& act_par_names,double _reg_factor,
+                              double mm_weight_sum)
+{
+    upgrades.clear();
+    upgrades.resize(lams.size());
+    if (!use_glm)
+    {
+        //the mda form scales obs_err by sqrt(lambda) before its second factorization, so there is
+        //no lambda-independent factorization to share: solve each lambda on copies of the inputs
+        for (int i = 0; i < lams.size(); i++)
+        {
+            Eigen::MatrixXd pr = par_resid, pd = par_diff, orr = obs_resid, od = obs_diff, oe = obs_err;
+            ensemble_solution(iter, verbose_level, maxsing, thread_id, t_count, use_prior_scaling, use_approx, use_glm,
+                              lams[i], eigthresh, pr, pd, Am, orr, od, upgrades[i], oe, weights, parcov_inv,
+                              act_obs_names, act_par_names, _reg_factor, mm_weight_sum);
+        }
+        return;
+    }
+
+    //glm form: the same scaling and factorization as ensemble_solution(), done once...
+    obs_resid = weights * obs_resid;
+    int num_reals = par_resid.cols();
+    double scale;
+    if ((mm_weight_sum > 0.0) & (mm_weight_sum < 1.0))
+        scale = (1.0 / (sqrt(mm_weight_sum - 1.0)));
+    else
+        scale = (1.0 / (sqrt(double(num_reals - 1))));
+    obs_diff = scale * (weights * obs_diff);
+    if (use_prior_scaling)
+        par_diff = scale * parcov_inv * par_diff;
+    else
+        par_diff = scale * par_diff;
+
+    Eigen::MatrixXd s, V, Ut;
+    SVD_REDSVD rsvd;
+    rsvd.solve_ip(obs_diff, s, Ut, V, eigthresh, maxsing);
+    Ut.transposeInPlace();
+    Eigen::VectorXd sv = s.col(0);
+    Eigen::VectorXd s2 = sv.cwiseProduct(sv);
+
+    //...then the lambda-independent products: X1 = U' * obs_resid (k x nreals) and
+    //PV = par_diff * V (npar x k).  Forming par_diff*V first (instead of V*S*X2 as in
+    //ensemble_solution()) is the same product with a different association and is
+    //nreals/npar times cheaper for a small parameter block.
+    Eigen::MatrixXd X1 = Ut * obs_resid;
+    Eigen::MatrixXd PV = par_diff * V;
+
+    //the full (non-approx) form prior term for iter > 1: everything but the 1/(s^2+lambda+1) scaling is lambda independent
+    bool use_full = ((!use_approx) && (iter > 1));
+    Eigen::MatrixXd VtX6;
+    if (use_full)
+    {
+        if (use_prior_scaling)
+            par_resid = parcov_inv * par_resid;
+        Eigen::MatrixXd x4 = Am.transpose() * par_resid;
+        par_resid.resize(0, 0);
+        Eigen::MatrixXd x5 = Am * x4;
+        Eigen::MatrixXd x6 = par_diff.transpose() * x5;
+        VtX6 = V.transpose() * x6;
+    }
+
+    //...and the cheap lambda-dependent part for each lambda value:
+    //  upgrade_1 = -par_diff * V * diag(s) * diag(1/(s^2 + lambda + 1)) * U' * obs_resid = -(PV * diag(s/(s^2+lambda+1))) * X1
+    //  upgrade_2 = -par_diff * V * diag(1/(s^2 + lambda + 1)) * V' * x6 = -(PV * diag(1/(s^2+lambda+1))) * V'x6
+    for (int i = 0; i < lams.size(); i++)
+    {
+        Eigen::VectorXd ivec = ((Eigen::VectorXd::Ones(s2.size()) * (lams[i] + 1.0)) + s2).cwiseInverse();
+        Eigen::MatrixXd upgrade_1 = -1.0 * ((PV * (sv.cwiseProduct(ivec)).asDiagonal()) * X1);
+        upgrade_1.transposeInPlace();
+        if (use_full)
+        {
+            Eigen::MatrixXd upgrade_2 = -1.0 * ((PV * ivec.asDiagonal()) * VtX6);
+            if (use_prior_scaling)
+                upgrade_2 = parcov_inv * upgrade_2;
+            if (_reg_factor >= 0)
+                upgrade_1 = upgrade_1 + (_reg_factor * upgrade_2.transpose());
+            else
+                upgrade_1 = upgrade_1 + upgrade_2.transpose();
+        }
+        upgrades[i] = upgrade_1;
+    }
+}
 
 void MmUpgradeThread::work(int thread_id, int iter, double cur_lam, bool use_glm_form, Eigen::VectorXd parcov_inv_vec, Eigen::MatrixXd Am)
 {
@@ -2177,6 +2371,170 @@ void LocalAnalysisUpgradeThread::work(int thread_id, int iter, double cur_lam, b
 		}
 	}
 
+}
+
+void LocalAnalysisUpgradeThread::work_multi_lambda(int thread_id, int iter, vector<double> lams, bool use_glm_form,
+									vector<string> par_names, vector<string> obs_names)
+{
+	//declare these helpers in here so they are thread safe...
+	class local_utils
+	{
+	public:
+		static Eigen::DiagonalMatrix<double, Eigen::Dynamic> get_matrix_from_map(vector<string>& names, unordered_map<string, double>& dmap)
+		{
+			Eigen::VectorXd vec(names.size());
+			int i = 0;
+			for (auto name : names)
+			{
+				vec[i] = dmap.at(name);
+				++i;
+			}
+			Eigen::DiagonalMatrix<double, Eigen::Dynamic> m = vec.asDiagonal();
+			return m;
+		}
+		static Eigen::MatrixXd get_matrix_from_map(int num_reals, vector<string>& names, unordered_map<string, Eigen::VectorXd>& emap)
+		{
+			Eigen::MatrixXd mat(num_reals, names.size());
+			mat.setZero();
+			for (int j = 0; j < names.size(); j++)
+			{
+				mat.col(j) = emap.at(names[j]);
+			}
+			return mat;
+		}
+	};
+
+	stringstream ss;
+	if (pe_upgrades.size() != lams.size())
+		throw runtime_error("LocalAnalysisUpgradeThread::work_multi_lambda(): pe_upgrades.size() != lams.size()");
+
+	unique_lock<mutex> ctrl_guard(ctrl_lock, defer_lock);
+	int maxsing, num_reals, verbose_level, pcount = 0, t_count;
+	double eigthresh;
+	bool use_approx;
+	bool use_prior_scaling;
+
+	while (true)
+	{
+		if (ctrl_guard.try_lock())
+		{
+			maxsing = pe_upgrade.get_pest_scenario_ptr()->get_svd_info().maxsing;
+			eigthresh = pe_upgrade.get_pest_scenario_ptr()->get_svd_info().eigthresh;
+			use_approx = pe_upgrade.get_pest_scenario_ptr()->get_pestpp_options().get_ies_use_approx();
+			use_prior_scaling = pe_upgrade.get_pest_scenario_ptr()->get_pestpp_options().get_ies_use_prior_scaling();
+			num_reals = pe_upgrade.shape().first;
+			verbose_level = pe_upgrade.get_pest_scenario_ptr()->get_pestpp_options().get_ies_verbose_level();
+			ctrl_guard.unlock();
+			break;
+		}
+	}
+	Eigen::MatrixXd par_resid, par_diff, Am;
+	Eigen::MatrixXd obs_resid, obs_diff, obs_err;
+	Eigen::DiagonalMatrix<double, Eigen::Dynamic> weights, parcov_inv;
+	string key;
+
+	unique_lock<mutex> next_guard(next_lock, defer_lock);
+	unique_lock<mutex> put_guard(put_lock, defer_lock);
+	int report_every = max(1, (int)(keys.size() / 20));
+
+	//This is the main thread loop - it continues until all upgrade pieces have been completed
+	while (true)
+	{
+		//First get a new case of par and obs names to solve with
+		par_names.clear();
+		obs_names.clear();
+		while (true)
+		{
+			if (next_guard.try_lock())
+			{
+				//if all the pieces have been completed, return
+				if (count == keys.size())
+				{
+					if (verbose_level > 3)
+					{
+						cout << "upgrade thread: " << thread_id << " processed " << pcount << " upgrade parts" << endl;
+					}
+					next_guard.unlock();
+					return;
+				}
+				key = keys[count];
+				pair<vector<string>, vector<string>> p = cases.at(key);
+				par_names = p.second;
+				obs_names = p.first;
+				if ((count % report_every == 0) && (count > 0))
+				{
+					ss.str("");
+					ss << "upgrade thread progress: " << count << " of " << total << " parts done";
+					if (verbose_level > 3)
+						cout << ss.str() << endl;
+					performance_log->log_event(ss.str());
+				}
+				count++;
+				t_count = count;
+				pcount++;
+				next_guard.unlock();
+				break;
+			}
+		}
+
+		//assemble the pieces for this case from the fast-lookup containers (read-only, thread safe)
+		obs_diff = local_utils::get_matrix_from_map(num_reals, obs_names, obs_diff_map);
+		obs_resid = local_utils::get_matrix_from_map(num_reals, obs_names, obs_resid_map);
+		obs_err = local_utils::get_matrix_from_map(num_reals, obs_names, obs_err_map);
+		par_diff = local_utils::get_matrix_from_map(num_reals, par_names, par_diff_map);
+		par_resid = local_utils::get_matrix_from_map(num_reals, par_names, par_resid_map);
+		weights = local_utils::get_matrix_from_map(obs_names, weight_map);
+		parcov_inv = local_utils::get_matrix_from_map(par_names, parcov_inv_map);
+		Am.resize(0, 0);
+		if ((!use_approx) && (iter > 1))
+		{
+			int am_cols = Am_map.at(par_names[0]).size();
+			Am.resize(par_names.size(), am_cols);
+			Am.setZero();
+			for (int j = 0; j < par_names.size(); j++)
+			{
+				Am.row(j) = Am_map.at(par_names[j]);
+			}
+		}
+
+		par_diff.transposeInPlace();
+		obs_diff.transposeInPlace();
+		obs_resid.transposeInPlace();
+		par_resid.transposeInPlace();
+		obs_err.transposeInPlace();
+
+		//optional multimodal realization weighting (columns are realizations)
+		double mm_weight_sum = -1.0;
+		if ((real_weights.size() > 0) && (real_weights.size() == par_diff.cols()))
+		{
+			Eigen::VectorXd swvec = real_weights.cwiseSqrt();
+			for (int j = 0; j < par_diff.cols(); j++)
+			{
+				par_diff.col(j) *= swvec[j];
+				obs_diff.col(j) *= swvec[j];
+			}
+			mm_weight_sum = real_weights.sum();
+		}
+
+		vector<Eigen::MatrixXd> upgrades;
+		UpgradeThread::ensemble_solution_multi_lambda(iter, verbose_level, maxsing, thread_id,
+		                                              t_count, use_prior_scaling, use_approx, use_glm_form,
+		                                              lams, eigthresh, par_resid, par_diff,
+		                                              Am, obs_resid, obs_diff, upgrades,
+		                                              obs_err, weights, parcov_inv,
+		                                              obs_names, par_names, reg_factor, mm_weight_sum);
+
+		while (true)
+		{
+			if (put_guard.try_lock())
+			{
+				for (int i = 0; i < lams.size(); i++)
+					pe_upgrades[i]->add_2_cols_ip(par_names, upgrades[i]);
+				put_guard.unlock();
+				break;
+			}
+		}
+	}
 }
 
 L2PhiHandler::L2PhiHandler(Pest *_pest_scenario, FileManager *_file_manager,
@@ -7433,9 +7791,31 @@ bool EnsembleMethod::solve(bool use_mda, vector<double> inflation_factors, vecto
     }
 
 
+    //for the localized (non-multimodal) solve, the expensive per-case assembly and factorization
+    //do not depend on lambda, so solve all lambda values in one pass over the localizer cases
+    bool multi_lam_localized = ((use_localizer) && (localizer.get_use()) && (mm_alpha <= 0.0) && (inflation_factors.size() > 0));
+    vector<ParameterEnsemble> pe_upgrades_all;
+    if (multi_lam_localized)
+    {
+        ss.str("");
+        ss << "starting localized calcs for all " << inflation_factors.size() << " " << (use_mda ? "mda" : "glm") << " factors";
+        message(1, ss.str());
+        message(2, "see .log file for more details");
+        for (int i = 0; i < inflation_factors.size(); i++)
+        {
+            pe_upgrades_all.push_back(ParameterEnsemble(pe.get_pest_scenario_ptr(), &rand_gen, pe.get_eigen(vector<string>(), act_par_names, false), pe.get_real_names(), act_par_names));
+            pe_upgrades_all[i].set_zeros();
+            pe_upgrades_all[i].set_trans_status(pe.get_trans_status());
+        }
+        es.solve_multi_lambda(num_threads, inflation_factors, !use_mda, pe_upgrades_all, loc_map);
+        message(1, "finished localized calcs for all factors");
+    }
+
     //solve for each factor
+    int ilam = -1;
     for (auto& cur_lam : inflation_factors)
 	{
+        ilam++;
 		ss.str("");
 		if (!use_mda)
 			message(1, "starting calcs for glm factor", cur_lam);
@@ -7443,17 +7823,25 @@ bool EnsembleMethod::solve(bool use_mda, vector<double> inflation_factors, vecto
 			message(1, "starting calcs for mda factor", cur_lam);
 		message(2, "see .log file for more details");
 
-		pe_upgrade = ParameterEnsemble(pe.get_pest_scenario_ptr(), &rand_gen, pe.get_eigen(vector<string>(), act_par_names, false), pe.get_real_names(), act_par_names);
-        pe_upgrade.set_zeros();
-		pe_upgrade.set_trans_status(pe.get_trans_status());
+		if (multi_lam_localized)
+		{
+			pe_upgrade = pe_upgrades_all[ilam];
+			pe_upgrades_all[ilam] = ParameterEnsemble();
+		}
+		else
+		{
+			pe_upgrade = ParameterEnsemble(pe.get_pest_scenario_ptr(), &rand_gen, pe.get_eigen(vector<string>(), act_par_names, false), pe.get_real_names(), act_par_names);
+			pe_upgrade.set_zeros();
+			pe_upgrade.set_trans_status(pe.get_trans_status());
 
-		if (mm_alpha > 0.0)
-        {
-            message(1,"multimodal solve for inflation factor ",cur_lam);
-            es.solve_multimodal(num_threads, cur_lam, !use_mda, pe_upgrade, loc_map, mm_alpha);
-        }
-		else{
-            es.solve(num_threads, cur_lam, !use_mda, pe_upgrade, loc_map);
+			if (mm_alpha > 0.0)
+			{
+				message(1,"multimodal solve for inflation factor ",cur_lam);
+				es.solve_multimodal(num_threads, cur_lam, !use_mda, pe_upgrade, loc_map, mm_alpha);
+			}
+			else{
+				es.solve(num_threads, cur_lam, !use_mda, pe_upgrade, loc_map);
+			}
 		}
 
 		map<string, double> norm_map;

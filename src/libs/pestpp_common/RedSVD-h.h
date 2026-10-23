@@ -209,7 +209,10 @@ namespace RedSVD
 			// Range(C) = Range(B)
 			DenseMatrix C = Z.transpose() * B;
 
-			Eigen::JacobiSVD<DenseMatrix> svdOfC(C, Eigen::ComputeThinU | Eigen::ComputeThinV);
+			//BDCSVD (divide and conquer) instead of JacobiSVD: same accuracy, orders of magnitude faster for
+			//the large (l ~ num_reals) projected matrices of the ensemble solves; BDCSVD uses JacobiSVD
+			//internally for small matrices so small problems are unaffected
+			Eigen::BDCSVD<DenseMatrix> svdOfC(C, Eigen::ComputeThinU | Eigen::ComputeThinV);
 
 			// C = USV^T  ->  A = Z * U * S * V^T * Y^T ; keep only the leading r triplets (truncate
 			// off the p oversampled directions)

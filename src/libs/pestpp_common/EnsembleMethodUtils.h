@@ -228,6 +228,9 @@ public:
 		double _reg_factor);
 
 	void solve(int num_threads, double cur_lam, bool use_glm_form, ParameterEnsemble& pe_upgrade, unordered_map<string, pair<vector<string>, vector<string>>>& loc_map);
+	//localized solve for several lambda values at once: each localizer case is assembled and
+	//factorized once and every lambda is applied to that factorization (pe_upgrades: one per lambda)
+	void solve_multi_lambda(int num_threads, const vector<double>& lams, bool use_glm_form, vector<ParameterEnsemble>& pe_upgrades, unordered_map<string, pair<vector<string>, vector<string>>>& loc_map);
     void solve_multimodal(int num_threads, double cur_lam, bool use_glm_form, ParameterEnsemble& pe_upgrade, unordered_map<string,pair<vector<string>, vector<string>>>& loc_map, double mm_alpha);
     void update_multimodal_components(const double mm_alpha);
 
@@ -319,6 +322,9 @@ public:
 		unordered_map<string, Eigen::VectorXd>& _Am_map, Localizer::How& _how, double _reg_factor);
 
 	virtual void work(int thread_id, int iter, double cur_lam, bool use_glm_form, vector<string> par_names, vector<string> obs_names) { ; }
+	virtual void work_multi_lambda(int thread_id, int iter, vector<double> lams, bool use_glm_form, vector<string> par_names, vector<string> obs_names) { ; }
+	//targets for the multi-lambda solve: one upgrade ensemble per lambda value (aligned with lams)
+	void set_pe_upgrades(vector<ParameterEnsemble*>& _pe_upgrades) { pe_upgrades = _pe_upgrades; }
 
 	//optional per-realization weights (aligned to the realization columns) for the localized
 	//multimodal solve; empty means no realization weighting
@@ -329,6 +335,16 @@ public:
                            const int t_count, const bool use_prior_scaling,const bool use_approx, const bool use_glm,
                            const double cur_lam,const double eigthresh, Eigen::MatrixXd& par_resid, Eigen::MatrixXd& par_diff,
                            const Eigen::MatrixXd& Am, Eigen::MatrixXd& obs_resid,Eigen::MatrixXd& obs_diff, Eigen::MatrixXd& upgrade_1,
+                           Eigen::MatrixXd& obs_err, const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& weights,
+                           const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& parcov_inv,
+                           const vector<string>& act_obs_names,const vector<string>& act_par_names, double _reg_factor,
+                           double mm_weight_sum = -1.0);
+    //same solution as ensemble_solution() but for a list of lambda values: the (expensive)
+    //scaling, SVD and lambda-independent products are done once, then each lambda is applied
+    static void ensemble_solution_multi_lambda(const int iter, const int verbose_level,const int maxsing,  const int thread_id,
+                           const int t_count, const bool use_prior_scaling,const bool use_approx, const bool use_glm,
+                           const vector<double>& lams,const double eigthresh, Eigen::MatrixXd& par_resid, Eigen::MatrixXd& par_diff,
+                           const Eigen::MatrixXd& Am, Eigen::MatrixXd& obs_resid,Eigen::MatrixXd& obs_diff, vector<Eigen::MatrixXd>& upgrades,
                            Eigen::MatrixXd& obs_err, const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& weights,
                            const Eigen::DiagonalMatrix<double, Eigen::Dynamic>& parcov_inv,
                            const vector<string>& act_obs_names,const vector<string>& act_par_names, double _reg_factor,
@@ -344,6 +360,7 @@ protected:
 	ParameterEnsemble& pe_upgrade;
 	Localizer& localizer;
 	Eigen::VectorXd real_weights;
+	vector<ParameterEnsemble*> pe_upgrades;
 	unordered_map<string, double>& parcov_inv_map;
 	unordered_map<string, double>& weight_map;
 
@@ -365,6 +382,7 @@ public:
 	using UpgradeThread::UpgradeThread;
 
 	void work(int thread_id, int iter, double cur_lam,bool use_glm_form, vector<string> par_names, vector<string> obs_names);
+	void work_multi_lambda(int thread_id, int iter, vector<double> lams, bool use_glm_form, vector<string> par_names, vector<string> obs_names);
 };
 
 class EnsembleMethod

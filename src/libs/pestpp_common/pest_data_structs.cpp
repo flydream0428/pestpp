@@ -1174,6 +1174,11 @@ bool PestppOptions::assign_ies_value_by_key(const string& key, const string& val
         ies_localizer_forgive_missing = pest_utils::parse_string_arg_to_bool(value);
         return true;
     }
+    else if (key == "IES_LOCALIZER_MERGE_COLS")
+    {
+        ies_localizer_merge_cols = pest_utils::parse_string_arg_to_bool(value);
+        return true;
+    }
     else if (key == "IES_PHI_FACTOR_FILE")
     {
         ies_phi_fractions_file = org_value;
@@ -2221,6 +2226,7 @@ void PestppOptions::summary(ostream& os) const
 	os << "ies_multimodal_weight_exponent: " << ies_multimodal_weight_exponent << endl;
 	os << "ies_multimodal_phi_weight: " << ies_multimodal_phi_weight << endl;
 	os << "ies_localizer_forgive_extra: " << ies_localizer_forgive_missing << endl;
+	os << "ies_localizer_merge_cols: " << ies_localizer_merge_cols << endl;
 	os << "ies_phi_factors_file: " << ies_phi_fractions_file << endl;
     os << "ies_phi_factors_by_real: " << ies_phi_factors_by_real << endl;
     os << "ies_n_iter_reinflate: " << endl;
@@ -2471,6 +2477,7 @@ void PestppOptions::set_defaults()
     set_ies_multimodal_phi_weight(0.5);
     set_ensemble_output_precision(20);
     set_ies_localizer_forgive_missing(false);
+    set_ies_localizer_merge_cols(true);
     set_ies_phi_fractions_files("");
     set_ies_phi_factors_by_real(false);
     set_ies_n_iter_reinflate(vector < int > {0});
