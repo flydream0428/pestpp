@@ -461,18 +461,65 @@ unordered_map<string, pair<vector<string>, vector<string>>> Localizer::process_m
 					idx_map[it.col()].push_back(it.row());
 			}
 		}
-		//populate the localizer map
-		for (auto &idx : idx_map)
+		//group columns with identical nonzero patterns into one upgrade case.  The local-analysis
+		//solve uses only the pattern (which obs inform which pars), not the values, so parameters
+		//whose columns are identical see exactly the same observation block and can be updated
+		//together in a single solve (the per-case solve already handles any number of parameters).
+		//For a 0/1 pilot-point localizer this typically cuts the number of solves by 10x or more.
+		bool merge_cols = pest_scenario_ptr->get_pestpp_options().get_ies_localizer_merge_cols();
+		map<int, vector<int>> col_groups; //representative col -> member cols (in col order)
+		if (merge_cols)
 		{
-			vpar = par_map[idx.first];
+			unordered_map<size_t, vector<int>> hash2cols;
+			size_t h;
+			for (auto& idx : idx_map)
+			{
+				const vector<int>& rows = idx.second;
+				h = rows.size();
+				for (auto r : rows)
+					h ^= (size_t)r + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+				bool found = false;
+				vector<int>& cands = hash2cols[h];
+				for (auto c : cands)
+				{
+					if (idx_map[c] == rows)
+					{
+						col_groups[c].push_back(idx.first);
+						found = true;
+						break;
+					}
+				}
+				if (!found)
+				{
+					cands.push_back(idx.first);
+					col_groups[idx.first].push_back(idx.first);
+				}
+			}
+			ss.str("");
+			ss << "localizer: " << idx_map.size() << " nonzero columns have " << col_groups.size() << " distinct patterns";
+			if (col_groups.size() < idx_map.size())
+				ss << ", merging identical columns into " << col_groups.size() << " upgrade cases (ies_localizer_merge_cols)";
+			performance_log->log_event(ss.str());
+			cout << "..." << ss.str() << endl;
+		}
+		else
+		{
+			for (auto& idx : idx_map)
+				col_groups[idx.first].push_back(idx.first);
+		}
+		//populate the localizer map
+		for (auto& grp : col_groups)
+		{
+			vpar.clear();
+			for (auto c : grp.second)
+				vpar.insert(vpar.end(), par_map[c].begin(), par_map[c].end());
 			vobs.clear();
-			for (auto &i : idx.second)
+			for (auto &i : idx_map[grp.first])
 			{
 				vobs.insert(vobs.end(), obs_map[i].begin(), obs_map[i].end());
 			}
 			pair<vector<string>, vector<string>> p(vobs, vpar);
-			//localizer_map.push_back(p);
-			localizer_map[col_names[idx.first]] = p;
+			localizer_map[col_names[grp.first]] = p;
 		}
 
 	}
